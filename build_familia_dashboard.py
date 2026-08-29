@@ -190,17 +190,45 @@ def build_data():
         return "Noche (18-23h)"
 
     hora_counts = defaultdict(int)
+    dia_counts = defaultdict(int)
     fechas = []
+    DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
     for m in matches:
         ts = int(m["finished_at"])
         fechas.append(ts)
         dt = datetime.datetime.utcfromtimestamp(ts) - datetime.timedelta(hours=3)
         hora_counts[bucket(dt.hour)] += 1
+        dia_counts[DIAS[dt.weekday()]] += 1
     total_matches = len(matches)
     hora_pico = [
         {"franja": k, "n": v, "pct": round(100 * v / total_matches, 1)}
         for k, v in hora_counts.items()
     ]
+    dia_semana = [
+        {"dia": d, "n": dia_counts.get(d, 0), "pct": round(100 * dia_counts.get(d, 0) / total_matches, 1)}
+        for d in DIAS
+    ]
+
+    # ---- carry vs. acompañado: mejor K/D individual en una derrota del
+    #      equipo (cargo y no alcanzo) y peor K/D individual en una
+    #      victoria (el equipo lo banco) ----
+    match_fecha = {m["match_id"]: int(m["finished_at"]) for m in matches}
+    derrotas, victorias = [], []
+    for r in stats:
+        kills, deaths = int(r["kills"] or 0), int(r["deaths"] or 0)
+        kd = kills / deaths if deaths else float(kills) if kills else 0.0
+        item = {
+            "nickname": r["nickname"], "kills": kills, "deaths": deaths,
+            "kd": round(kd, 2), "map": r["map"].replace("de_", ""),
+            "fecha": fmt_fecha(match_fecha[r["match_id"]]) if r["match_id"] in match_fecha else "",
+        }
+        (victorias if int(r["team_won"]) else derrotas).append(item)
+    derrotas.sort(key=lambda d: -d["kd"])
+    victorias.sort(key=lambda d: d["kd"])
+    carry_destacados = {
+        "mejor_en_derrota": derrotas[:5],
+        "peor_en_victoria": victorias[:5],
+    }
 
     resumen = {
         "amigos": len(nicknames),
@@ -213,12 +241,15 @@ def build_data():
 
     return {
         "resumen": resumen,
+        "amigos": nicknames,
         "impacto": impacto,
         "presencia": presencia,
         "duos": duos,
         "formaciones": formaciones,
         "mapas": mapas,
         "hora_pico": hora_pico,
+        "dia_semana": dia_semana,
+        "carry_destacados": carry_destacados,
         "size_counts": {str(k): v for k, v in sorted(size_counts.items())},
         "generado": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
@@ -463,6 +494,22 @@ TEMPLATE = r"""<!doctype html>
   .conf-media { color: var(--ink-muted); }
   .conf-alta { color: var(--ink-muted); }
 
+  .filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .filter-row label { font-size: 12px; color: var(--ink-secondary); }
+  .filter-row select {
+    font-family: inherit; font-size: 12.5px; color: var(--ink-primary); background: var(--page);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; cursor: pointer;
+  }
+  .filter-row select:hover { border-color: var(--ink-muted); }
+  .filter-empty { color: var(--ink-muted); font-size: 12.5px; padding: 10px 0; }
+
+  .carry-list { display: flex; flex-direction: column; gap: 8px; }
+  .carry-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; background: var(--page); }
+  .carry-row .rank-badge { margin-right: 0; }
+  .carry-row .who { font-weight: 600; flex: 1; }
+  .carry-row .box { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 12px; color: var(--ink-secondary); }
+  .carry-row .ctx { font-size: 11.5px; color: var(--ink-muted); white-space: nowrap; }
+
   ::selection { background: var(--blue-wash); }
 
   @media (max-width: 880px) {
@@ -515,6 +562,10 @@ TEMPLATE = r"""<!doctype html>
       <a class="nav-item" data-target="s-hora" href="#s-hora">
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.4"/><path d="M8 5v3.3l2.3 1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         Hora pico de juego
+      </a>
+      <a class="nav-item" data-target="s-carry" href="#s-carry">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 8l3.5 3.5L13 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Carry vs. acompañado
       </a>
     </nav>
 
@@ -569,13 +620,21 @@ TEMPLATE = r"""<!doctype html>
 
       <section class="panel reveal" id="s-duos">
         <div class="panel-head"><h2>Mejores y peores dúos</h2><span class="tag">03</span></div>
-        <p class="sub">Las combinaciones de a 2 que jugaron juntos alguna vez, ordenadas por partidas compartidas — clic en una columna para ordenar distinto.</p>
+        <p class="sub">Las combinaciones de a 2 que jugaron juntos alguna vez — clic en una columna para ordenar distinto, o filtrá por un amigo.</p>
+        <div class="filter-row">
+          <label for="filter-duos">Filtrar por amigo:</label>
+          <select id="filter-duos"><option value="">Todos</option></select>
+        </div>
         <div id="table-duos"></div>
       </section>
 
       <section class="panel reveal" id="s-formaciones">
         <div class="panel-head"><h2>Formaciones más frecuentes</h2><span class="tag">04</span></div>
         <p class="sub">Combinaciones exactas de 2 a 5 amigos en el mismo equipo, con al menos 3 partidas jugadas así.</p>
+        <div class="filter-row">
+          <label for="filter-formaciones">Filtrar por amigo:</label>
+          <select id="filter-formaciones"><option value="">Todos</option></select>
+        </div>
         <div id="table-formaciones"></div>
       </section>
 
@@ -587,9 +646,27 @@ TEMPLATE = r"""<!doctype html>
 
       <section class="panel reveal" id="s-hora">
         <div class="panel-head"><h2>¿Cuándo juega La Familia?</h2><span class="tag">06</span></div>
-        <p class="sub">Partidas compartidas por franja horaria, aproximado a UTC-3</p>
-        <div class="chart-wrap" id="chart-hora"></div>
+        <p class="sub">Partidas compartidas por franja horaria y por día de la semana, aproximado a UTC-3</p>
+        <div class="grid-2">
+          <div><div class="chart-wrap" id="chart-hora"></div></div>
+          <div><div class="chart-wrap" id="chart-dia"></div></div>
+        </div>
         <p class="finding" id="finding-hora"></p>
+      </section>
+
+      <section class="panel reveal" id="s-carry">
+        <div class="panel-head"><h2>Carry vs. acompañado</h2><span class="tag">07</span></div>
+        <p class="sub">El mejor K/D individual en una partida que el equipo terminó perdiendo (cargó y no alcanzó), y el peor K/D en una que terminaron ganando (lo bancó el resto). Dato más para reírse que para sacar conclusiones.</p>
+        <div class="grid-2">
+          <div>
+            <h3 style="font-size:12px;font-weight:700;color:var(--ink-secondary);margin:0 0 8px">Cargó y no alcanzó</h3>
+            <div class="carry-list" id="carry-derrota"></div>
+          </div>
+          <div>
+            <h3 style="font-size:12px;font-weight:700;color:var(--ink-secondary);margin:0 0 8px">Lo bancaron</h3>
+            <div class="carry-list" id="carry-victoria"></div>
+          </div>
+        </div>
       </section>
 
     </div>
@@ -846,10 +923,25 @@ horizontalBarsDiverging("chart-impacto", DATA.impacto.map(d => ({
     { key: "win_pct", label: "Win %", num: true, fmt: v => v + "%" },
     { key: "confianza", label: "Confianza" },
   ];
-  let rows = DATA.duos.map(d => ({ ...d, duo: `${d.a} + ${d.b}` }));
+  const allRows = DATA.duos.map(d => ({ ...d, duo: `${d.a} + ${d.b}` }));
   let sortKey = "n", sortDir = -1;
+  let filterNick = "";
+
+  const select = document.getElementById("filter-duos");
+  DATA.amigos.forEach(nick => {
+    const opt = document.createElement("option");
+    opt.value = nick; opt.textContent = nick;
+    select.appendChild(opt);
+  });
+  select.addEventListener("change", () => { filterNick = select.value; render(); });
 
   function render() {
+    const box = document.getElementById("table-duos");
+    let rows = filterNick ? allRows.filter(r => r.a === filterNick || r.b === filterNick) : allRows.slice();
+    if (!rows.length) {
+      box.innerHTML = `<p class="filter-empty">${filterNick} no tiene partidas compartidas registradas todavía.</p>`;
+      return;
+    }
     rows.sort((a, b) => {
       if (typeof a[sortKey] === "string") return a[sortKey].localeCompare(b[sortKey]) * sortDir;
       return (a[sortKey] - b[sortKey]) * sortDir || 0;
@@ -884,7 +976,6 @@ horizontalBarsDiverging("chart-impacto", DATA.impacto.map(d => ({
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
-    const box = document.getElementById("table-duos");
     box.innerHTML = ""; box.appendChild(table);
   }
   render();
@@ -898,10 +989,25 @@ horizontalBarsDiverging("chart-impacto", DATA.impacto.map(d => ({
     { key: "n", label: "Partidas", num: true },
     { key: "win_pct", label: "Win %", num: true, fmt: v => v + "%" },
   ];
-  let rows = DATA.formaciones.map(d => ({ ...d, formacion: d.integrantes.join(" + ") }));
+  const allRows = DATA.formaciones.map(d => ({ ...d, formacion: d.integrantes.join(" + ") }));
   let sortKey = "n", sortDir = -1;
+  let filterNick = "";
+
+  const select = document.getElementById("filter-formaciones");
+  DATA.amigos.forEach(nick => {
+    const opt = document.createElement("option");
+    opt.value = nick; opt.textContent = nick;
+    select.appendChild(opt);
+  });
+  select.addEventListener("change", () => { filterNick = select.value; render(); });
 
   function render() {
+    const box = document.getElementById("table-formaciones");
+    let rows = filterNick ? allRows.filter(r => r.integrantes.includes(filterNick)) : allRows.slice();
+    if (!rows.length) {
+      box.innerHTML = `<p class="filter-empty">${filterNick} no aparece en ninguna formación con al menos 3 partidas.</p>`;
+      return;
+    }
     rows.sort((a, b) => {
       if (typeof a[sortKey] === "string") return a[sortKey].localeCompare(b[sortKey]) * sortDir;
       return (a[sortKey] - b[sortKey]) * sortDir || 0;
@@ -934,7 +1040,6 @@ horizontalBarsDiverging("chart-impacto", DATA.impacto.map(d => ({
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
-    const box = document.getElementById("table-formaciones");
     box.innerHTML = ""; box.appendChild(table);
   }
   render();
@@ -946,7 +1051,7 @@ horizontalBars("chart-mapas", DATA.mapas.map(d => ({
   tip: `<b>de_${d.map}</b>: ${d.win_pct}% win rate (n=${d.n})`,
 })), { rowH: 28, refLine: 50, ariaLabel: "Win rate por mapa" });
 
-/* --- 06: hora pico --- */
+/* --- 06: hora pico + dia de la semana --- */
 (function () {
   const order = ["Madrugada (0-5h)", "Mañana (6-11h)", "Tarde (12-17h)", "Noche (18-23h)"];
   const rows = order.map(f => DATA.hora_pico.find(d => d.franja === f)).filter(Boolean);
@@ -954,9 +1059,37 @@ horizontalBars("chart-mapas", DATA.mapas.map(d => ({
     label: d.franja.replace(/\s*\(.*\)/, ""), value: d.pct, valueLabel: `${d.pct}%`, color: "var(--blue)",
     tip: `<b>${d.franja}</b>: ${d.n} partidas (${d.pct}%)`,
   })), { ariaLabel: "Partidas por franja horaria" });
+
+  const diaOrder = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+  const diaRows = diaOrder.map(d => DATA.dia_semana.find(x => x.dia === d)).filter(Boolean);
+  verticalBars("chart-dia", diaRows.map(d => ({
+    label: d.dia.slice(0, 3), value: d.pct, valueLabel: `${d.pct}%`, color: "var(--orange)",
+    tip: `<b>${d.dia}</b>: ${d.n} partidas (${d.pct}%)`,
+  })), { ariaLabel: "Partidas por día de la semana" });
+
   const top = [...rows].sort((a, b) => b.pct - a.pct)[0];
+  const topDia = [...diaRows].sort((a, b) => b.pct - a.pct)[0];
   document.getElementById("finding-hora").innerHTML =
-    `La franja con más partidas es <strong>${top.franja}</strong>, con ${top.pct}% del total.`;
+    `La franja con más partidas es <strong>${top.franja}</strong> (${top.pct}%), y el día es <strong>${topDia.dia}</strong> (${topDia.pct}%).`;
+})();
+
+/* --- 07: carry vs. acompañado --- */
+(function () {
+  function renderCarryList(containerId, items, label) {
+    const box = document.getElementById(containerId);
+    box.innerHTML = "";
+    items.forEach((d, i) => {
+      const row = document.createElement("div");
+      row.className = "carry-row";
+      row.innerHTML = `<span class="rank-badge">${i + 1}</span>
+        <span class="who">${d.nickname}</span>
+        <span class="box">${d.kills}-${d.deaths} (K/D ${d.kd})</span>
+        <span class="ctx">de_${d.map} · ${d.fecha}</span>`;
+      box.appendChild(row);
+    });
+  }
+  renderCarryList("carry-derrota", DATA.carry_destacados.mejor_en_derrota);
+  renderCarryList("carry-victoria", DATA.carry_destacados.peor_en_victoria);
 })();
 
 /* ---------- aparición de secciones y stat tiles al hacer scroll ---------- */
