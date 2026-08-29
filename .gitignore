@@ -1,0 +1,13 @@
+# entornos / cache de Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# secretos -- la API key SIEMPRE va por variable de entorno, nunca en un archivo
+.env
+*.key
+
+# sistema
+.DS_Store
+Thumbs.db

@@ -1,0 +1,60 @@
+name: Actualizar datos y dashboard
+
+# Corre el pipeline completo (fetch -> build_familia_dashboard) una vez por
+# semana, sin intervención manual. Si hay partidas nuevas, commitea los CSV
+# y el dashboard actualizados de vuelta a main -- eso dispara el redeploy
+# automático de Vercel.
+#
+# Necesita el secreto FACEIT_API_KEY (Settings -> Secrets and variables ->
+# Actions -> New repository secret) con la API key del Developer Portal de
+# FACEIT. Nunca queda expuesta en el código ni en los logs.
+
+on:
+  schedule:
+    # Domingos 03:00 UTC (medianoche aprox. en Argentina).
+    - cron: "0 3 * * 0"
+  workflow_dispatch: {}  # permite dispararlo a mano desde la pestaña "Actions"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-familia
+  cancel-in-progress: false  # nunca cortar una corrida a mitad de camino
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Extraer datos nuevos de FACEIT
+        env:
+          FACEIT_API_KEY: ${{ secrets.FACEIT_API_KEY }}
+        run: python fetch_amigos_data.py
+
+      - name: Regenerar el dashboard
+        run: python build_familia_dashboard.py
+
+      - name: Commitear cambios (si los hay)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/raw/*.csv dashboard.html index.html
+          if git diff --cached --quiet; then
+            echo "Sin cambios -- no hay nada que commitear."
+          else
+            git commit -m "Actualización automática semanal de datos"
+            git push
+          fi

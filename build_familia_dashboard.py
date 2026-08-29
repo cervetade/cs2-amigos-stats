@@ -1,0 +1,993 @@
+#!/usr/bin/env python3
+"""
+Construye dashboard.html ("La Familia - Estadisticas") a partir de los CSV
+en data/raw/ (generados por fetch_amigos_data.py).
+
+Mismo patron que build_dashboard.py del proyecto principal: los datos se
+calculan ac'a, se vuelcan a JSON, y se embeben en el TEMPLATE de abajo. Para
+editar el dashboard a mano: extraer el HTML, editarlo, y volver a pegarlo
+ac'a arriba de "__DATA_JSON__" (mismo mecanismo que cs2-sudamerica-analytics).
+
+Uso:
+    python3 build_familia_dashboard.py
+"""
+import csv
+import json
+import datetime
+from collections import defaultdict, Counter
+from pathlib import Path
+
+RAW = Path(__file__).parent / "data" / "raw"
+OUT = Path(__file__).parent / "dashboard.html"
+
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+def fmt_fecha(ts):
+    d = datetime.datetime.utcfromtimestamp(ts)
+    return f"{d.day} {MESES[d.month - 1]} {d.year}"
+
+
+def read_csv(name):
+    with open(RAW / name, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def tier_friend(n):
+    if n >= 100:
+        return "alta"
+    if n >= 50:
+        return "media"
+    return "baja"
+
+
+def tier_pair(n):
+    if n >= 20:
+        return "alta"
+    if n >= 8:
+        return "media"
+    return "baja"
+
+
+def build_data():
+    friends = read_csv("amigos_friends.csv")
+    matches = read_csv("amigos_matches.csv")
+    stats = read_csv("amigos_match_stats.csv")
+
+    nicknames = sorted(f["nickname"] for f in friends)
+
+    # ---- agrupar filas de stats por (match_id, team_id) para encontrar "squads" ----
+    squads = defaultdict(list)
+    for r in stats:
+        squads[(r["match_id"], r["team_id"])].append(r)
+    coplay_squads = {k: v for k, v in squads.items() if len(v) >= 2}
+
+    size_counts = Counter(len(v) for v in coplay_squads.values())
+
+    # ---- presencia individual dentro del dataset compartido ----
+    per_friend = defaultdict(lambda: {"n": 0, "wins": 0, "kills": 0, "deaths": 0, "hs_sum": 0})
+    for r in stats:
+        d = per_friend[r["nickname"]]
+        d["n"] += 1
+        d["wins"] += int(r["team_won"])
+        d["kills"] += int(r["kills"] or 0)
+        d["deaths"] += int(r["deaths"] or 0)
+        d["hs_sum"] += float(r["headshots_percent"] or 0)
+
+    presencia = []
+    for nick in nicknames:
+        d = per_friend[nick]
+        n = d["n"]
+        win_pct = round(100 * d["wins"] / n, 1) if n else 0.0
+        kd = round(d["kills"] / d["deaths"], 2) if d["deaths"] else 0.0
+        hs = round(d["hs_sum"] / n, 1) if n else 0.0
+        presencia.append({
+            "nickname": nick, "n": n, "win_pct": win_pct, "kd": kd, "hs_pct": hs,
+            "confianza": tier_friend(n),
+        })
+    presencia.sort(key=lambda d: -d["n"])
+
+    # ---- pares: cada combinacion de 2 dentro de un squad ----
+    pair_stats = defaultdict(lambda: {"n": 0, "wins": 0})
+    formation_stats = defaultdict(lambda: {"n": 0, "wins": 0})
+    for (match_id, team_id), rows in coplay_squads.items():
+        won = int(rows[0]["team_won"])
+        nicks = sorted(r["nickname"] for r in rows)
+        for i in range(len(nicks)):
+            for j in range(i + 1, len(nicks)):
+                key = (nicks[i], nicks[j])
+                pair_stats[key]["n"] += 1
+                pair_stats[key]["wins"] += won
+        fkey = tuple(nicks)
+        formation_stats[fkey]["n"] += 1
+        formation_stats[fkey]["wins"] += won
+
+    duos = []
+    for (a, b), d in pair_stats.items():
+        n = d["n"]
+        win_pct = round(100 * d["wins"] / n, 1)
+        duos.append({"a": a, "b": b, "n": n, "win_pct": win_pct, "confianza": tier_pair(n)})
+    duos.sort(key=lambda d: -d["n"])
+
+    formaciones = []
+    for nicks, d in formation_stats.items():
+        n = d["n"]
+        if n < 3:
+            continue
+        win_pct = round(100 * d["wins"] / n, 1)
+        formaciones.append({
+            "integrantes": list(nicks), "tamano": len(nicks), "n": n, "win_pct": win_pct,
+        })
+    formaciones.sort(key=lambda d: -d["n"])
+
+    # ---- impacto neto: para cada amigo, promedio ponderado del delta de win rate
+    #      de cada companero CON vs. SIN el (piso de muestra: >=3 partidas juntos
+    #      y que el companero tenga partidas propias sin el target) ----
+    def pair_key(a, b):
+        return tuple(sorted([a, b]))
+
+    impacto = []
+    for target in nicknames:
+        deltas = []
+        total_games = 0
+        companeros_usados = 0
+        for other in nicknames:
+            if other == target:
+                continue
+            key = pair_key(target, other)
+            if key not in pair_stats:
+                continue
+            n_with = pair_stats[key]["n"]
+            wins_with = pair_stats[key]["wins"]
+            n_other_total = per_friend[other]["n"]
+            wins_other_total = per_friend[other]["wins"]
+            n_without = n_other_total - n_with
+            wins_without = wins_other_total - wins_with
+            if n_without <= 0 or n_with < 3:
+                continue
+            wr_with = wins_with / n_with
+            wr_without = wins_without / n_without
+            delta = wr_with - wr_without
+            deltas.append((delta, n_with))
+            total_games += n_with
+            companeros_usados += 1
+        if not deltas:
+            continue
+        weighted = sum(d * n for d, n in deltas) / sum(n for _, n in deltas)
+        impacto.append({
+            "nickname": target,
+            "impacto_pts": round(weighted * 100, 1),
+            "companeros": companeros_usados,
+            "partidas_consideradas": total_games,
+            "n_propio": per_friend[target]["n"],
+            "win_pct_propio": presencia_by_nick(presencia, target)["win_pct"],
+            "confianza": tier_friend(per_friend[target]["n"]),
+        })
+    impacto.sort(key=lambda d: -d["impacto_pts"])
+
+    # ---- mapas del grupo (filas jugador/partida, no partidas unicas) ----
+    map_stats = defaultdict(lambda: {"n": 0, "wins": 0})
+    for r in stats:
+        map_stats[r["map"]]["n"] += 1
+        map_stats[r["map"]]["wins"] += int(r["team_won"])
+    mapas = []
+    for m, d in map_stats.items():
+        if d["n"] < 20:
+            continue
+        mapas.append({
+            "map": m.replace("de_", ""), "n": d["n"], "win_pct": round(100 * d["wins"] / d["n"], 1),
+        })
+    mapas.sort(key=lambda d: -d["win_pct"])
+
+    # ---- hora pico (por partida, aproximado a UTC-3) ----
+    def bucket(h):
+        if 0 <= h < 6:
+            return "Madrugada (0-5h)"
+        if 6 <= h < 12:
+            return "Mañana (6-11h)"
+        if 12 <= h < 18:
+            return "Tarde (12-17h)"
+        return "Noche (18-23h)"
+
+    hora_counts = defaultdict(int)
+    fechas = []
+    for m in matches:
+        ts = int(m["finished_at"])
+        fechas.append(ts)
+        dt = datetime.datetime.utcfromtimestamp(ts) - datetime.timedelta(hours=3)
+        hora_counts[bucket(dt.hour)] += 1
+    total_matches = len(matches)
+    hora_pico = [
+        {"franja": k, "n": v, "pct": round(100 * v / total_matches, 1)}
+        for k, v in hora_counts.items()
+    ]
+
+    resumen = {
+        "amigos": len(nicknames),
+        "partidas_compartidas": total_matches,
+        "formaciones_distintas": len(formation_stats),
+        "partidas_5_juntos": size_counts.get(5, 0),
+        "periodo_desde": fmt_fecha(min(fechas)),
+        "periodo_hasta": fmt_fecha(max(fechas)),
+    }
+
+    return {
+        "resumen": resumen,
+        "impacto": impacto,
+        "presencia": presencia,
+        "duos": duos,
+        "formaciones": formaciones,
+        "mapas": mapas,
+        "hora_pico": hora_pico,
+        "size_counts": {str(k): v for k, v in sorted(size_counts.items())},
+        "generado": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+def presencia_by_nick(presencia, nick):
+    for p in presencia:
+        if p["nickname"] == nick:
+            return p
+    return {"win_pct": 0.0}
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>La Familia — Estadísticas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #ffffff;
+    --page: #f7f7f5;
+    --sidebar: #ffffff;
+    --ink-primary: #14161a;
+    --ink-secondary: #5c6068;
+    --ink-muted: #8b8f97;
+    --grid: #ebebe8;
+    --baseline: #d4d4d0;
+    --border: #e4e4e1;
+    --blue: #2a78d6;
+    --blue-wash: #eaf2fc;
+    --orange: #eb6834;
+    --seq-1: #86b6ef;
+    --seq-2: #5598e7;
+    --seq-3: #2a78d6;
+    --seq-4: #184f95;
+    --seq5-1: #86b6ef;
+    --seq5-2: #5598e7;
+    --seq5-3: #2a78d6;
+    --seq5-4: #1c5cab;
+    --seq5-5: #104281;
+    --good: #0ca30c;
+    --diverge-pos: #0ca30c;
+    --diverge-neg: #d1453b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1c1d1f;
+      --page: #131415;
+      --sidebar: #18191b;
+      --ink-primary: #f4f4f3;
+      --ink-secondary: #b7b8bb;
+      --ink-muted: #85868b;
+      --grid: #2a2b2d;
+      --baseline: #38393c;
+      --border: #2a2b2d;
+      --blue: #4c94ec;
+      --blue-wash: #1c2c40;
+      --orange: #e0743c;
+      --seq-1: #6da7ec;
+      --seq-2: #3987e5;
+      --seq-3: #256abf;
+      --seq-4: #104281;
+      --seq5-1: #6da7ec;
+      --seq5-2: #3987e5;
+      --seq5-3: #256abf;
+      --seq5-4: #184f95;
+      --seq5-5: #0d366b;
+      --good: #1ec01e;
+      --diverge-pos: #1ec01e;
+      --diverge-neg: #e2645a;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink-primary);
+    font-family: 'Geist', -apple-system, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+    font-size: 14px;
+  }
+  a { color: var(--blue); }
+  .mono, .stat .num, .value-label, .axis-label, td.num, th.num, .nav-item .n, section.panel .tag {
+    font-family: 'Geist Mono', ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+
+  .shell { display: flex; min-height: 100vh; }
+
+  .sidebar {
+    width: 240px; flex-shrink: 0; background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    padding: 18px 12px 16px; z-index: 20;
+    transition: transform 0.2s ease;
+  }
+  .sidebar .brand {
+    display: flex; align-items: center; gap: 9px; padding: 4px 8px 16px;
+  }
+  .sidebar .brand .mark {
+    width: 26px; height: 26px; border-radius: 7px; background: var(--blue);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12.5px; flex-shrink: 0;
+  }
+  .sidebar .brand .name { font-weight: 700; font-size: 13.5px; line-height: 1.25; }
+  .sidebar .brand .name span { display: block; font-weight: 500; color: var(--ink-muted); font-size: 11px; }
+
+  .nav-label {
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--ink-muted); padding: 14px 10px 6px;
+  }
+  nav.nav-list { display: flex; flex-direction: column; gap: 1px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 7px;
+    color: var(--ink-secondary); text-decoration: none; font-size: 13px; font-weight: 500;
+    cursor: pointer; border: none; background: none; width: 100%; text-align: left;
+  }
+  .nav-item:hover { background: var(--page); color: var(--ink-primary); }
+  .nav-item.active { background: var(--blue-wash); color: var(--blue); }
+  .nav-item svg { flex-shrink: 0; opacity: 0.85; }
+  .nav-item .n { margin-left: auto; font-size: 10.5px; color: var(--ink-muted); background: var(--page); border-radius: 999px; padding: 1px 6px; }
+  .nav-item.active .n { color: var(--blue); background: #fff; }
+
+  .sidebar hr { border: none; border-top: 1px solid var(--border); margin: 12px 4px; }
+
+  .sidebar .foot { padding: 14px 10px 4px; font-size: 11.5px; color: var(--ink-muted); }
+  .sidebar .foot a { color: var(--ink-secondary); text-decoration: none; }
+  .sidebar .foot a:hover { color: var(--blue); }
+
+  .sidebar-toggle {
+    display: none; position: fixed; top: 14px; left: 14px; z-index: 30;
+    width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink-primary); align-items: center; justify-content: center; cursor: pointer;
+  }
+  .sidebar-backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(15,16,18,0.4); z-index: 19;
+  }
+
+  main { flex: 1; margin-left: 240px; min-width: 0; }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 20px 32px; border-bottom: 1px solid var(--border); background: var(--surface);
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
+  }
+  .topbar h1 { font-size: 1.15rem; margin: 0 0 2px; }
+  .topbar p { margin: 0; color: var(--ink-secondary); font-size: 12.5px; max-width: 560px; }
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 6px; background: var(--blue); color: #fff;
+    padding: 8px 16px; border-radius: 7px; font-size: 12.5px; font-weight: 600; text-decoration: none;
+    white-space: nowrap;
+  }
+  .btn-primary:hover { opacity: 0.92; }
+
+  .season-badge {
+    display: inline-flex; align-items: center; font-family: 'Geist Mono', ui-monospace, monospace;
+    font-size: 10.5px; font-weight: 600; color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent);
+    border-radius: 999px; padding: 2px 9px; margin-left: 8px; vertical-align: middle;
+  }
+
+  .content { max-width: 980px; padding: 24px 32px 100px; }
+
+  .stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 24px; }
+  @media (max-width: 720px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    padding: 13px 15px;
+  }
+  .stat .num { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.01em; }
+  .stat .label { font-size: 11.5px; color: var(--ink-muted); margin-top: 1px; }
+
+  section.panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    padding: 20px 22px 18px; margin-bottom: 18px; scroll-margin-top: 84px;
+  }
+  section.panel .panel-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; flex-wrap: wrap; }
+  section.panel h2 { font-size: 0.98rem; margin: 0; }
+  section.panel .tag {
+    font-size: 10.5px; font-weight: 700; color: var(--ink-muted); background: var(--page);
+    border-radius: 999px; padding: 1.5px 8px;
+  }
+  section.panel .sub { color: var(--ink-secondary); font-size: 12.5px; margin: 0 0 16px; }
+  section.panel .finding {
+    color: var(--ink-secondary); font-size: 12.5px; margin-top: 14px; line-height: 1.6;
+    padding-top: 14px; border-top: 1px solid var(--grid);
+  }
+  section.panel .finding strong { color: var(--ink-primary); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .chart-wrap { position: relative; }
+  .chart-legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 0 0 10px; }
+  .chart-legend .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-secondary); }
+  .chart-legend .legend-dot { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
+  svg text { fill: var(--ink-secondary); font-family: inherit; }
+  svg .value-label { fill: var(--ink-primary); font-weight: 600; }
+  svg .axis-label { fill: var(--ink-muted); font-size: 10.5px; }
+  svg .baseline { stroke: var(--baseline); stroke-width: 1; }
+  svg .ref-line { stroke: var(--baseline); stroke-width: 1; stroke-dasharray: 3 3; }
+  .bar { cursor: pointer; transition: opacity 0.12s, height 0.55s cubic-bezier(.22,.9,.3,1), y 0.55s cubic-bezier(.22,.9,.3,1), width 0.55s cubic-bezier(.22,.9,.3,1); }
+  .bar:hover { opacity: 0.82; }
+  svg .value-label { opacity: 0; transition: opacity 0.35s ease 0.4s; }
+  svg .value-label.show { opacity: 1; }
+
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.6s ease, transform 0.6s ease; }
+  .reveal.show { opacity: 1; transform: translateY(0); }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .bar { transition: opacity 0.12s; }
+    svg .value-label { opacity: 1; transition: none; }
+  }
+
+  .tooltip {
+    position: fixed; pointer-events: none; background: var(--ink-primary); color: var(--surface);
+    font-size: 11.5px; padding: 6px 10px; border-radius: 6px; white-space: nowrap;
+    transform: translate(-50%, -100%); opacity: 0; transition: opacity 0.1s; z-index: 40;
+    top: 0; left: 0;
+  }
+  .tooltip.show { opacity: 0.97; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--ink-muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.03em; cursor: pointer; user-select: none; }
+  th:hover { color: var(--ink-primary); }
+  th.sorted::after { content: " \25BE"; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:hover td { background: var(--page); }
+  .rank-badge {
+    display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px;
+    border-radius: 5px; background: var(--page); color: var(--ink-muted); font-size: 10px; font-weight: 700;
+    margin-right: 6px;
+  }
+  .conf-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+  .conf-baja { color: var(--diverge-neg); }
+  .conf-media { color: var(--ink-muted); }
+  .conf-alta { color: var(--ink-muted); }
+
+  ::selection { background: var(--blue-wash); }
+
+  @media (max-width: 880px) {
+    main { margin-left: 0; }
+    .topbar { padding-left: 60px; }
+    .content { padding-left: 16px; padding-right: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<button class="sidebar-toggle" id="sidebar-toggle" aria-label="Abrir menú">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+</button>
+<div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="mark">LF</div>
+      <div class="name">La Familia<span>Estadísticas</span></div>
+    </div>
+
+    <div class="nav-label">Hallazgos</div>
+    <nav class="nav-list">
+      <a class="nav-item" data-target="s-resumen" href="#s-resumen">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.4"/></svg>
+        Resumen
+      </a>
+      <a class="nav-item" data-target="s-impacto" href="#s-impacto">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 2l1.7 3.6 4 .5-3 2.8.8 4-3.5-1.9-3.5 1.9.8-4-3-2.8 4-.5L8 2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+        El mufa y el amuleto
+      </a>
+      <a class="nav-item" data-target="s-presencia" href="#s-presencia">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 13V7M8 13V3M13 13V9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        Rendimiento individual
+      </a>
+      <a class="nav-item" data-target="s-duos" href="#s-duos">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="5.5" cy="6" r="2.3" stroke="currentColor" stroke-width="1.3"/><circle cx="10.5" cy="6" r="2.3" stroke="currentColor" stroke-width="1.3"/><path d="M2.3 13c.4-2.3 1.8-3.6 3.2-3.6s2.8 1.3 3.2 3.6M7.3 13c.4-2.3 1.8-3.6 3.2-3.6s2.8 1.3 3.2 3.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        Mejores y peores dúos
+      </a>
+      <a class="nav-item" data-target="s-formaciones" href="#s-formaciones">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="2.5" width="4.5" height="3.5" rx="0.8" stroke="currentColor" stroke-width="1.2"/><rect x="9.5" y="2.5" width="4.5" height="3.5" rx="0.8" stroke="currentColor" stroke-width="1.2"/><rect x="6" y="10" width="4.5" height="3.5" rx="0.8" stroke="currentColor" stroke-width="1.2"/><path d="M4.2 6v2a1 1 0 001 1H8m3.7-3v2a1 1 0 01-1 1H8m0 0v1" stroke="currentColor" stroke-width="1.1"/></svg>
+        Formaciones frecuentes
+      </a>
+      <a class="nav-item" data-target="s-mapas" href="#s-mapas">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 4l4-1.4 4 1.4 4-1.4v9.8l-4 1.4-4-1.4-4 1.4V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M6 2.6v9.8M10 4v9.8" stroke="currentColor" stroke-width="1.3"/></svg>
+        Mapas del grupo
+      </a>
+      <a class="nav-item" data-target="s-hora" href="#s-hora">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.4"/><path d="M8 5v3.3l2.3 1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        Hora pico de juego
+      </a>
+    </nav>
+
+    <hr>
+    <div class="nav-label">Proyecto</div>
+    <nav class="nav-list">
+      <a class="nav-item" href="https://github.com/cervetade/cs2-amigos-stats" target="_blank" rel="noopener">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Ver en GitHub
+      </a>
+      <a class="nav-item" href="https://github.com/cervetade/cs2-amigos-stats/blob/main/README.md" target="_blank" rel="noopener">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M4 2h6l3 3v9H4V2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M6 7h4M6 9.5h4M6 12h2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        README
+      </a>
+    </nav>
+
+    <div class="foot">
+      Datos: <a href="https://docs.faceit.com/docs/data-api/" target="_blank" rel="noopener">FACEIT Data API v4</a><br>
+      por <a href="https://github.com/cervetade" target="_blank" rel="noopener">@cervetade</a>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <div>
+        <h1>La Familia <span class="season-badge">Estadísticas</span></h1>
+        <p id="header-sub">Cruzamos el historial de FACEIT de los 12 para encontrar cada partida donde jugamos de compañeros — quién suma cuando juega con vos, y quién complica. Se actualiza solo, todos los domingos.</p>
+      </div>
+      <a class="btn-primary" href="https://github.com/cervetade/cs2-amigos-stats" target="_blank" rel="noopener">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Ver repositorio
+      </a>
+    </div>
+
+    <div class="content">
+
+      <div class="stat-row" id="s-resumen"><div class="stat-row" id="stat-row" style="grid-column:1/-1;display:contents"></div></div>
+
+      <section class="panel reveal" id="s-impacto">
+        <div class="panel-head"><h2>¿Quién te hace ganar y quién te hace perder?</h2><span class="tag">01</span></div>
+        <p class="sub">Para cada amigo: cuánto cambia el win rate de sus compañeros cuando juegan CON él, comparado a cuando juegan SIN él (promedio ponderado por partidas). Verde = amuleto, rojo = mufa.</p>
+        <div class="chart-wrap" id="chart-impacto"></div>
+        <p class="finding" id="finding-impacto"></p>
+      </section>
+
+      <section class="panel reveal" id="s-presencia">
+        <div class="panel-head"><h2>¿Quién juega mejor cuando estamos todos?</h2><span class="tag">02</span></div>
+        <p class="sub">Win rate, K/D y HS% de cada uno dentro de las partidas compartidas (no su historial en solitario).</p>
+        <div class="chart-wrap" id="chart-presencia"></div>
+        <p class="finding" id="finding-presencia"></p>
+      </section>
+
+      <section class="panel reveal" id="s-duos">
+        <div class="panel-head"><h2>Mejores y peores dúos</h2><span class="tag">03</span></div>
+        <p class="sub">Las combinaciones de a 2 que jugaron juntos alguna vez, ordenadas por partidas compartidas — clic en una columna para ordenar distinto.</p>
+        <div id="table-duos"></div>
+      </section>
+
+      <section class="panel reveal" id="s-formaciones">
+        <div class="panel-head"><h2>Formaciones más frecuentes</h2><span class="tag">04</span></div>
+        <p class="sub">Combinaciones exactas de 2 a 5 amigos en el mismo equipo, con al menos 3 partidas jugadas así.</p>
+        <div id="table-formaciones"></div>
+      </section>
+
+      <section class="panel reveal" id="s-mapas">
+        <div class="panel-head"><h2>Los mapas del grupo</h2><span class="tag">05</span></div>
+        <p class="sub">Win rate combinado de los 12 en cada mapa (mínimo 20 filas jugador/partida) — la línea punteada marca 50%</p>
+        <div class="chart-wrap" id="chart-mapas"></div>
+      </section>
+
+      <section class="panel reveal" id="s-hora">
+        <div class="panel-head"><h2>¿Cuándo juega La Familia?</h2><span class="tag">06</span></div>
+        <p class="sub">Partidas compartidas por franja horaria, aproximado a UTC-3</p>
+        <div class="chart-wrap" id="chart-hora"></div>
+        <p class="finding" id="finding-hora"></p>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const DATA = __DATA_JSON__;
+
+/* ---------- mobile sidebar ---------- */
+const sidebar = document.getElementById("sidebar");
+const toggleBtn = document.getElementById("sidebar-toggle");
+const backdrop = document.getElementById("sidebar-backdrop");
+function openSidebar() { sidebar.classList.add("open"); backdrop.style.display = "block"; }
+function closeSidebar() { sidebar.classList.remove("open"); backdrop.style.display = "none"; }
+toggleBtn.addEventListener("click", () => sidebar.classList.contains("open") ? closeSidebar() : openSidebar());
+backdrop.addEventListener("click", closeSidebar);
+
+const mq = window.matchMedia("(max-width: 880px)");
+function applyResponsive() {
+  if (mq.matches) {
+    sidebar.style.transform = sidebar.classList.contains("open") ? "translateX(0)" : "translateX(-100%)";
+    toggleBtn.style.display = "flex";
+  } else {
+    sidebar.style.transform = "";
+    toggleBtn.style.display = "none";
+    backdrop.style.display = "none";
+  }
+}
+mq.addEventListener("change", applyResponsive);
+new MutationObserver(applyResponsive).observe(sidebar, { attributes: true, attributeFilter: ["class"] });
+applyResponsive();
+
+document.querySelectorAll('.nav-item[data-target]').forEach(a => {
+  a.addEventListener("click", () => { if (mq.matches) closeSidebar(); });
+});
+
+/* ---------- scrollspy ---------- */
+const navItems = Array.from(document.querySelectorAll('.nav-item[data-target]'));
+const sections = navItems.map(a => document.getElementById(a.dataset.target)).filter(Boolean);
+const spy = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    const link = navItems.find(a => a.dataset.target === entry.target.id);
+    if (!link) return;
+    if (entry.isIntersecting) {
+      navItems.forEach(a => a.classList.remove("active"));
+      link.classList.add("active");
+    }
+  });
+}, { rootMargin: "-15% 0px -70% 0px", threshold: 0 });
+sections.forEach(s => spy.observe(s));
+
+/* ---------- tooltip ---------- */
+const tooltip = document.getElementById("tooltip");
+function showTooltip(evt, html) { tooltip.innerHTML = html; tooltip.classList.add("show"); moveTooltip(evt); }
+function moveTooltip(evt) {
+  tooltip.style.left = evt.clientX + "px";
+  tooltip.style.top = (evt.clientY - 10) + "px";
+}
+function hideTooltip() { tooltip.classList.remove("show"); }
+
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+/* ---------- animación de entrada: barras "creciendo" al hacer scroll ---------- */
+function playEntrance(containerEl, bars, labels) {
+  const run = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        bars.forEach(b => { for (const k in b.final) b.rect.setAttribute(k, b.final[k]); });
+        (labels || []).forEach(l => l && l.classList.add("show"));
+      });
+    });
+  };
+  const panel = containerEl && containerEl.closest(".reveal");
+  if (!panel || panel.classList.contains("show")) { run(); return; }
+  (panel.__pendingBarAnims || (panel.__pendingBarAnims = [])).push(run);
+}
+
+function verticalBars(containerId, items, opts) {
+  opts = opts || {};
+  const container = document.getElementById(containerId);
+  const width = container.clientWidth || 420;
+  const height = opts.height || 250;
+  const padTop = 16, padBottom = 32, padSide = 8;
+  const maxVal = opts.max || Math.max(...items.map(d => d.value)) * 1.2;
+  const n = items.length, gap = 0.38;
+  const bw = (width - padSide * 2) / n;
+  const svg = el("svg", { width: "100%", height, viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": opts.ariaLabel || "" });
+  container.innerHTML = ""; container.appendChild(svg);
+  const baseline = height - padBottom;
+
+  if (opts.refLine !== undefined) {
+    const y = baseline - (opts.refLine / maxVal) * (height - padTop - padBottom);
+    svg.appendChild(el("line", { x1: padSide, x2: width - padSide, y1: y, y2: y, class: "ref-line" }));
+  }
+  const bars = [], labels = [];
+  items.forEach((d, i) => {
+    const x = padSide + i * bw + bw * gap / 2;
+    const barW = bw * (1 - gap);
+    const barH = Math.max(2, (d.value / maxVal) * (height - padTop - padBottom));
+    const y = baseline - barH;
+    const rect = el("rect", { x, y: baseline, width: barW, height: 0, rx: 3, fill: d.color || "var(--blue)", class: "bar" });
+    rect.addEventListener("mouseenter", (e) => showTooltip(e, d.tip || `<b>${d.label}</b>: ${d.value}`));
+    rect.addEventListener("mousemove", moveTooltip);
+    rect.addEventListener("mouseleave", hideTooltip);
+    svg.appendChild(rect);
+    bars.push({ rect, final: { y, height: barH } });
+    const vlabel = el("text", { x: x + barW / 2, y: y - 6, "text-anchor": "middle", class: "value-label", "font-size": "12" });
+    vlabel.textContent = d.valueLabel !== undefined ? d.valueLabel : d.value;
+    svg.appendChild(vlabel);
+    labels.push(vlabel);
+    const llabel = el("text", { x: x + barW / 2, y: height - padBottom + 16, "text-anchor": "middle", class: "axis-label" });
+    llabel.textContent = d.label;
+    svg.appendChild(llabel);
+  });
+  svg.appendChild(el("line", { x1: padSide, x2: width - padSide, y1: baseline, y2: baseline, class: "baseline" }));
+  playEntrance(container, bars, labels);
+}
+
+function horizontalBars(containerId, items, opts) {
+  opts = opts || {};
+  const container = document.getElementById(containerId);
+  const width = container.clientWidth || 420;
+  const rowH = opts.rowH || 30;
+  const padLeft = opts.padLeft || 92, padRight = 52;
+  const height = items.length * rowH + 8;
+  const maxVal = opts.max || Math.max(...items.map(d => d.value)) * 1.12;
+  const svg = el("svg", { width: "100%", height, viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": opts.ariaLabel || "" });
+  container.innerHTML = ""; container.appendChild(svg);
+  const bars = [], labels = [];
+
+  if (opts.refLine !== undefined) {
+    const x = padLeft + (opts.refLine / maxVal) * (width - padLeft - padRight);
+    svg.appendChild(el("line", { x1: x, x2: x, y1: 0, y2: height, class: "ref-line" }));
+  }
+
+  items.forEach((d, i) => {
+    const y = i * rowH + 6, barH = rowH - 12;
+    const barW = Math.max(2, (d.value / maxVal) * (width - padLeft - padRight));
+    const label = el("text", { x: padLeft - 8, y: y + barH / 2 + 4, "text-anchor": "end", "font-size": "12" });
+    label.textContent = d.label;
+    svg.appendChild(label);
+    const rect = el("rect", { x: padLeft, y, width: 0, height: barH, rx: 3, fill: d.color || "var(--blue)", class: "bar" });
+    rect.addEventListener("mouseenter", (e) => showTooltip(e, d.tip || `<b>${d.label}</b>: ${d.value}`));
+    rect.addEventListener("mousemove", moveTooltip);
+    rect.addEventListener("mouseleave", hideTooltip);
+    svg.appendChild(rect);
+    bars.push({ rect, final: { width: barW } });
+    const vlabel = el("text", { x: padLeft + barW + 8, y: y + barH / 2 + 4, class: "value-label", "font-size": "12" });
+    vlabel.textContent = d.valueLabel !== undefined ? d.valueLabel : d.value;
+    svg.appendChild(vlabel);
+    labels.push(vlabel);
+  });
+  playEntrance(container, bars, labels);
+}
+
+/* ---------- barras horizontales divergentes (pueden arrancar de un punto != 0) ---------- */
+function horizontalBarsDiverging(containerId, items, opts) {
+  opts = opts || {};
+  const container = document.getElementById(containerId);
+  const width = container.clientWidth || 420;
+  const rowH = opts.rowH || 30;
+  const padLeft = opts.padLeft || 92, padRight = 60;
+  const height = items.length * rowH + 8;
+  const maxAbs = opts.max || Math.max(...items.map(d => Math.abs(d.value))) * 1.15;
+  const plotW = width - padLeft - padRight;
+  const zeroX = padLeft + plotW / 2;
+  const scale = (plotW / 2) / maxAbs;
+  const svg = el("svg", { width: "100%", height, viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": opts.ariaLabel || "" });
+  container.innerHTML = ""; container.appendChild(svg);
+  const bars = [], labels = [];
+
+  svg.appendChild(el("line", { x1: zeroX, x2: zeroX, y1: 0, y2: height, class: "baseline" }));
+
+  items.forEach((d, i) => {
+    const y = i * rowH + 6, barH = rowH - 12;
+    const barW = Math.max(2, Math.abs(d.value) * scale);
+    const x = d.value >= 0 ? zeroX : zeroX - barW;
+    const label = el("text", { x: padLeft - 8, y: y + barH / 2 + 4, "text-anchor": "end", "font-size": "12" });
+    label.textContent = d.label;
+    svg.appendChild(label);
+    const rect = el("rect", { x: zeroX, y, width: 0, height: barH, rx: 3, fill: d.color || "var(--blue)", class: "bar" });
+    rect.addEventListener("mouseenter", (e) => showTooltip(e, d.tip || `<b>${d.label}</b>: ${d.value}`));
+    rect.addEventListener("mousemove", moveTooltip);
+    rect.addEventListener("mouseleave", hideTooltip);
+    svg.appendChild(rect);
+    bars.push({ rect, final: { x, width: barW } });
+    const vx = d.value >= 0 ? zeroX + barW + 8 : zeroX - barW - 8;
+    const vlabel = el("text", { x: vx, y: y + barH / 2 + 4, "text-anchor": d.value >= 0 ? "start" : "end", class: "value-label", "font-size": "12" });
+    vlabel.textContent = d.valueLabel !== undefined ? d.valueLabel : d.value;
+    svg.appendChild(vlabel);
+    labels.push(vlabel);
+  });
+  playEntrance(container, bars, labels);
+}
+
+function renderResumen(boxId, r) {
+  const tiles = [
+    { num: r.amigos, label: "Amigos analizados" },
+    { num: r.partidas_compartidas.toLocaleString("es-AR"), label: "Partidas compartidas" },
+    { num: r.formaciones_distintas.toLocaleString("es-AR"), label: "Formaciones distintas" },
+    { num: r.partidas_5_juntos.toLocaleString("es-AR"), label: "Partidas con los 5 en el equipo" },
+  ];
+  const box = document.getElementById(boxId);
+  tiles.forEach((t, i) => {
+    const div = document.createElement("div");
+    div.className = "stat reveal";
+    div.style.transitionDelay = `${i * 0.06}s`;
+    div.innerHTML = `<div class="num">${t.num}</div><div class="label">${t.label}</div>`;
+    box.appendChild(div);
+  });
+}
+renderResumen("stat-row", DATA.resumen);
+document.getElementById("header-sub").innerHTML =
+  `Cruzamos el historial de FACEIT de los 12 (${DATA.resumen.periodo_desde} — ${DATA.resumen.periodo_hasta}) para encontrar cada partida donde jugamos de compañeros — quién suma cuando juega con vos, y quién complica. Se actualiza solo, todos los domingos.`;
+
+/* --- 01: impacto neto (el mufa / el amuleto) --- */
+horizontalBarsDiverging("chart-impacto", DATA.impacto.map(d => ({
+  label: d.nickname, value: d.impacto_pts,
+  valueLabel: (d.impacto_pts > 0 ? "+" : "") + d.impacto_pts,
+  color: d.impacto_pts >= 0 ? "var(--diverge-pos)" : "var(--diverge-neg)",
+  tip: `<b>${d.nickname}</b>: ${d.impacto_pts > 0 ? "+" : ""}${d.impacto_pts} pts — basado en ${d.companeros} compañeros y ${d.partidas_consideradas} partidas (confianza ${d.confianza}, ${d.n_propio} partidas propias)`,
+})), { rowH: 32, padLeft: 100, ariaLabel: "Impacto neto en el win rate de los compañeros" });
+
+(function () {
+  const sorted = DATA.impacto;
+  const best = sorted[0], worst = sorted[sorted.length - 1];
+  const bajaConfianza = sorted.filter(d => d.confianza === "baja").map(d => d.nickname);
+  document.getElementById("finding-impacto").innerHTML =
+    `<strong>${best.nickname}</strong> es el mejor amuleto del grupo (${best.impacto_pts > 0 ? "+" : ""}${best.impacto_pts} pts) y <strong>${worst.nickname}</strong> el más mufa (${worst.impacto_pts} pts). Ojo con los números de muestra chica` +
+    (bajaConfianza.length ? ` — <strong>${bajaConfianza.join(", ")}</strong> tienen confianza "baja" (menos de 50 partidas propias en el dataset), así que sus valores pueden moverse mucho con pocas partidas más.` : ".");
+})();
+
+/* --- 02: rendimiento individual --- */
+(function () {
+  const rows = [...DATA.presencia].sort((a, b) => b.win_pct - a.win_pct);
+  horizontalBars("chart-presencia", rows.map(d => ({
+    label: d.nickname, value: d.win_pct, valueLabel: `${d.win_pct}%`, color: "var(--blue)",
+    tip: `<b>${d.nickname}</b>: ${d.win_pct}% win rate · K/D ${d.kd} · HS% ${d.hs_pct} (n=${d.n}, confianza ${d.confianza})`,
+  })), { rowH: 28, padLeft: 100, refLine: 50, ariaLabel: "Win rate individual dentro de las partidas compartidas" });
+  const best = rows[0], worst = rows[rows.length - 1];
+  document.getElementById("finding-presencia").innerHTML =
+    `<strong>${best.nickname}</strong> lidera con ${best.win_pct}% de win rate (n=${best.n}); <strong>${worst.nickname}</strong> cierra la tabla con ${worst.win_pct}% (n=${worst.n}).`;
+})();
+
+/* --- 03: dúos (tabla ordenable) --- */
+(function () {
+  const cols = [
+    { key: "duo", label: "Dúo" },
+    { key: "n", label: "Partidas juntos", num: true },
+    { key: "win_pct", label: "Win %", num: true, fmt: v => v + "%" },
+    { key: "confianza", label: "Confianza" },
+  ];
+  let rows = DATA.duos.map(d => ({ ...d, duo: `${d.a} + ${d.b}` }));
+  let sortKey = "n", sortDir = -1;
+
+  function render() {
+    rows.sort((a, b) => {
+      if (typeof a[sortKey] === "string") return a[sortKey].localeCompare(b[sortKey]) * sortDir;
+      return (a[sortKey] - b[sortKey]) * sortDir || 0;
+    });
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const trh = document.createElement("tr");
+    cols.forEach(c => {
+      const th = document.createElement("th");
+      th.textContent = c.label;
+      if (c.num) th.classList.add("num");
+      if (c.key === sortKey) th.classList.add("sorted");
+      th.addEventListener("click", () => { if (sortKey === c.key) sortDir *= -1; else { sortKey = c.key; sortDir = c.key === "duo" || c.key === "confianza" ? 1 : -1; } render(); });
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh); table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    rows.forEach((r, i) => {
+      const tr = document.createElement("tr");
+      cols.forEach((c, ci) => {
+        const td = document.createElement("td");
+        if (c.num) td.classList.add("num");
+        if (ci === 0) {
+          td.innerHTML = `<span class="rank-badge">${i + 1}</span>${r.duo}`;
+        } else if (c.key === "confianza") {
+          td.innerHTML = `<span class="conf-tag conf-${r.confianza}">${r.confianza}</span>`;
+        } else {
+          td.textContent = c.fmt ? c.fmt(r[c.key]) : r[c.key];
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    const box = document.getElementById("table-duos");
+    box.innerHTML = ""; box.appendChild(table);
+  }
+  render();
+})();
+
+/* --- 04: formaciones (tabla ordenable) --- */
+(function () {
+  const cols = [
+    { key: "formacion", label: "Formación" },
+    { key: "tamano", label: "Tamaño", num: true },
+    { key: "n", label: "Partidas", num: true },
+    { key: "win_pct", label: "Win %", num: true, fmt: v => v + "%" },
+  ];
+  let rows = DATA.formaciones.map(d => ({ ...d, formacion: d.integrantes.join(" + ") }));
+  let sortKey = "n", sortDir = -1;
+
+  function render() {
+    rows.sort((a, b) => {
+      if (typeof a[sortKey] === "string") return a[sortKey].localeCompare(b[sortKey]) * sortDir;
+      return (a[sortKey] - b[sortKey]) * sortDir || 0;
+    });
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const trh = document.createElement("tr");
+    cols.forEach(c => {
+      const th = document.createElement("th");
+      th.textContent = c.label;
+      if (c.num) th.classList.add("num");
+      if (c.key === sortKey) th.classList.add("sorted");
+      th.addEventListener("click", () => { if (sortKey === c.key) sortDir *= -1; else { sortKey = c.key; sortDir = c.key === "formacion" ? 1 : -1; } render(); });
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh); table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    rows.forEach((r, i) => {
+      const tr = document.createElement("tr");
+      cols.forEach((c, ci) => {
+        const td = document.createElement("td");
+        if (c.num) td.classList.add("num");
+        if (ci === 0) {
+          td.innerHTML = `<span class="rank-badge">${i + 1}</span>${r.formacion}`;
+        } else {
+          td.textContent = c.fmt ? c.fmt(r[c.key]) : r[c.key];
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    const box = document.getElementById("table-formaciones");
+    box.innerHTML = ""; box.appendChild(table);
+  }
+  render();
+})();
+
+/* --- 05: mapas del grupo --- */
+horizontalBars("chart-mapas", DATA.mapas.map(d => ({
+  label: `de_${d.map}`, value: d.win_pct, valueLabel: `${d.win_pct}%`, color: "var(--blue)",
+  tip: `<b>de_${d.map}</b>: ${d.win_pct}% win rate (n=${d.n})`,
+})), { rowH: 28, refLine: 50, ariaLabel: "Win rate por mapa" });
+
+/* --- 06: hora pico --- */
+(function () {
+  const order = ["Madrugada (0-5h)", "Mañana (6-11h)", "Tarde (12-17h)", "Noche (18-23h)"];
+  const rows = order.map(f => DATA.hora_pico.find(d => d.franja === f)).filter(Boolean);
+  verticalBars("chart-hora", rows.map(d => ({
+    label: d.franja.replace(/\s*\(.*\)/, ""), value: d.pct, valueLabel: `${d.pct}%`, color: "var(--blue)",
+    tip: `<b>${d.franja}</b>: ${d.n} partidas (${d.pct}%)`,
+  })), { ariaLabel: "Partidas por franja horaria" });
+  const top = [...rows].sort((a, b) => b.pct - a.pct)[0];
+  document.getElementById("finding-hora").innerHTML =
+    `La franja con más partidas es <strong>${top.franja}</strong>, con ${top.pct}% del total.`;
+})();
+
+/* ---------- aparición de secciones y stat tiles al hacer scroll ---------- */
+const revealObserver = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (!entry.isIntersecting) return;
+    entry.target.classList.add("show");
+    revealObserver.unobserve(entry.target);
+    if (entry.target.__pendingBarAnims) {
+      entry.target.__pendingBarAnims.forEach(run => run());
+      entry.target.__pendingBarAnims = null;
+    }
+  });
+}, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+document.querySelectorAll(".reveal").forEach(elm => revealObserver.observe(elm));
+
+window.addEventListener("resize", () => { clearTimeout(window.__rz); window.__rz = setTimeout(() => location.reload(), 300); });
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    data = build_data()
+    html = TEMPLATE.replace("__DATA_JSON__", json.dumps(data, ensure_ascii=False))
+    OUT.write_text(html, encoding="utf-8")
+    print(f"OK -> {OUT} ({len(html):,} bytes)")
+    print(f"  amigos={data['resumen']['amigos']}  partidas={data['resumen']['partidas_compartidas']}  "
+          f"formaciones={data['resumen']['formaciones_distintas']}")
+
+
+if __name__ == "__main__":
+    main()

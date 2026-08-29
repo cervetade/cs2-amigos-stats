@@ -1,0 +1,8 @@
+# El deploy en Vercel es solo para el dashboard estatico (index.html /
+# dashboard.html). Todo esto es para el pipeline de datos y no debe
+# subirse: evita que Vercel confunda los .py con funciones serverless y
+# acelera el deploy.
+*.py
+requirements.txt
+data/
+.gitignore
