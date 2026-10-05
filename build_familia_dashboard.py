@@ -1117,6 +1117,8 @@ def main():
     data = build_data()
     html = TEMPLATE.replace("__DATA_JSON__", json.dumps(data, ensure_ascii=False))
     OUT.write_text(html, encoding="utf-8")
+    # Vercel sirve index.html: mantenerlo siempre igual a dashboard.html
+    (OUT.parent / "index.html").write_text(html, encoding="utf-8")
     print(f"OK -> {OUT} ({len(html):,} bytes)")
     print(f"  amigos={data['resumen']['amigos']}  partidas={data['resumen']['partidas_compartidas']}  "
           f"formaciones={data['resumen']['formaciones_distintas']}")
