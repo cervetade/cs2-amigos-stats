@@ -233,9 +233,11 @@ def main():
     new_history_rows = []
     for i, f in enumerate(friends, 1):
         pid = f["player_id"]
-        if already_have_by_player.get(pid, 0) > 0:
-            print(f"  [{i}/{len(friends)}] {f['nickname']}: ya tengo {already_have_by_player[pid]} partidas guardadas, salteo.")
-            continue
+        # Si ya hay historial guardado de este jugador, se pide desde lo mas
+        # nuevo y se corta apenas aparece una partida que ya tenemos (FACEIT
+        # devuelve el historial de la mas reciente a la mas vieja), asi cada
+        # corrida solo baja lo nuevo en vez de saltearse al jugador entero.
+        had_history = already_have_by_player.get(pid, 0) > 0
         offset = 0
         count = 0
         while offset < MAX_OFFSET_SAFETY:
@@ -245,12 +247,14 @@ def main():
             items = page.get("items", [])
             if not items:
                 break
+            hit_known = False
             for m in items:
                 match_id = m.get("match_id")
                 if not match_id:
                     continue
                 key = (pid, match_id)
                 if key in existing_history_keys:
+                    hit_known = True
                     continue
                 existing_history_keys.add(key)
                 new_history_rows.append({
@@ -261,8 +265,10 @@ def main():
                 count += 1
             if len(items) < HISTORY_PAGE_SIZE:
                 break  # ultima pagina
+            if had_history and hit_known:
+                break  # de aca para atras ya lo tenemos todo
             offset += HISTORY_PAGE_SIZE
-        print(f"  [{i}/{len(friends)}] {f['nickname']}: {count} partidas de historial")
+        print(f"  [{i}/{len(friends)}] {f['nickname']}: {count} partidas nuevas de historial")
 
     all_history = existing_history + new_history_rows
     write_csv("amigos_history.csv", all_history, ["player_id", "match_id", "finished_at"])
